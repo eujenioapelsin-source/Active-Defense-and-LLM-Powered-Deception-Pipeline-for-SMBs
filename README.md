@@ -1,4 +1,4 @@
-$readme_text = @'
+
 # Aegis Ledger: Active Defense and Threat Intelligence Pipeline
 
 Aegis Ledger is a zero-trust, microservice-based security pipeline designed for small to medium-sized businesses (SMBs). It moves beyond passive blocking by actively deceiving attackers with believable fake data while collecting threat intelligence.
