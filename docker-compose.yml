@@ -1,0 +1,148 @@
+name: aegis-ledger
+
+x-hardened: &hardened
+  restart: unless-stopped
+  read_only: true
+  tmpfs: ["/tmp:size=64m,mode=1777"]
+  security_opt: [no-new-privileges:true]
+  cap_drop: [ALL]
+  logging:
+    driver: json-file
+    options: { max-size: "10m", max-file: "3" }
+
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?set in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set in .env}
+      POSTGRES_DB: ${POSTGRES_DB:?set in .env}
+      POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256"
+    networks: [internal_net]
+    volumes: [db_data:/var/lib/postgresql/data]
+    security_opt: [no-new-privileges:true]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB} -h 127.0.0.1"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --requirepass
+      - ${REDIS_PASSWORD:?set in .env}
+      - --maxmemory
+      - 256mb
+      - --maxmemory-policy
+      - allkeys-lru
+      - --protected-mode
+      - "yes"
+    networks: [internal_net]
+    volumes: [redis_data:/data]
+    security_opt: [no-new-privileges:true]
+    healthcheck:
+      test: ["CMD", "sh", "-c", "redis-cli -a \"$$REDIS_PASSWORD\" PING | grep -q PONG"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+
+  api:
+    <<: *hardened
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command:
+      - uvicorn
+      - src.api.main:app
+      - --host=0.0.0.0
+      - --port=8000
+      - --limit-concurrency=200
+      - --no-server-header
+    environment:
+      APP_ENV: ${APP_ENV:-production}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      ENABLE_DOCS: ${ENABLE_DOCS:-false}
+      TRUSTED_HOSTS: ${TRUSTED_HOSTS:-api,localhost,127.0.0.1}
+      CONSOLE_TOKEN: ${AEGIS_CONSOLE_TOKEN:?set in .env}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_HOST: db
+      POSTGRES_PORT: "5432"
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+      TARPIT_THRESHOLD: ${TARPIT_THRESHOLD:-5}
+      TARPIT_DELAY_SECONDS: ${TARPIT_DELAY_SECONDS:-3}
+      SHADOW_BAN_TTL_SECONDS: ${SHADOW_BAN_TTL_SECONDS:-3600}
+    networks: [internal_net]
+    depends_on:
+      db: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import sys,urllib.request;sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz',timeout=3).status==200 else 1)"
+      interval: 10s
+      timeout: 5s
+      retries: 6
+
+  worker:
+    <<: *hardened
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["python", "-m", "src.worker.worker"]
+    environment:
+      APP_ENV: ${APP_ENV:-production}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_HOST: db
+      POSTGRES_PORT: "5432"
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+      LLM_PROVIDER: ${LLM_PROVIDER:-mock}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_BASE_URL: ${LLM_BASE_URL:-https://api.openai.com/v1}
+      LLM_MODEL: ${LLM_MODEL:-gpt-4o-mini}
+      WORKER_POLL_INTERVAL_SECONDS: ${WORKER_POLL_INTERVAL_SECONDS:-5}
+      WORKER_BATCH_SIZE: ${WORKER_BATCH_SIZE:-10}
+    networks: [internal_net, egress_net]
+    depends_on:
+      api: { condition: service_healthy }
+
+  web:
+    <<: *hardened
+    build:
+      context: ./web
+      dockerfile: Dockerfile
+    environment:
+      NODE_ENV: production
+      API_BASE_URL: http://api:8000
+      AEGIS_CONSOLE_TOKEN: ${AEGIS_CONSOLE_TOKEN:?set in .env}
+      NEXT_TELEMETRY_DISABLED: "1"
+    networks: [internal_net, edge_net]
+    ports:
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      api: { condition: service_healthy }
+
+networks:
+  internal_net: { driver: bridge, internal: true }
+  egress_net:   { driver: bridge }
+  edge_net:     { driver: bridge }
+
+volumes:
+  db_data:    { driver: local }
+  redis_data: { driver: local }
